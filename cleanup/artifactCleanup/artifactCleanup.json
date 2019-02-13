@@ -1,15 +1,16 @@
 {
     "policies": [
         {
-            "cron": "0 0 1 ? * 1",
+            "cron": "0 0 12 ? * 6",
             "repos": [
-                "libs-releases-local"
+                "libs-snapshot-local"
             ],
-            "timeUnit": "day",
-            "timeInterval": 3,
-            "dryRun": true,
+            "timeUnit": "month",
+            "timeInterval": 2,
+            "dryRun": false,
             "paceTimeMS": 500,
             "disablePropertiesSupport": true
         }
     ]
 }
+
