@@ -1,13 +1,14 @@
 import org.jfrog.artifactory.client.ArtifactoryRequest
 import org.jfrog.artifactory.client.impl.ArtifactoryRequestImpl
-import org.jfrog.artifactory.client.model.PackageType
+import org.jfrog.artifactory.client.model.impl.PackageTypeImpl
 import org.jfrog.artifactory.client.model.repository.settings.impl.DockerRepositorySettingsImpl
 import org.jfrog.artifactory.client.model.repository.settings.impl.MavenRepositorySettingsImpl
 import org.jfrog.artifactory.client.model.repository.settings.impl.YumRepositorySettingsImpl
 import spock.lang.Specification
 import spock.lang.Shared
+import groovy.json.JsonSlurper
 
-import static org.jfrog.artifactory.client.ArtifactoryClient.create
+import org.jfrog.artifactory.client.ArtifactoryClientBuilder
 
 class ArtifactoryMigrationHelperTest extends Specification {
     public static final String MAVEN_LOCAL_KEY = 'libs-release-local'
@@ -17,10 +18,12 @@ class ArtifactoryMigrationHelperTest extends Specification {
     public static final String RPM_LOCAL_KEY = 'rpm-local'
 
     static final sourceBaseurl = 'http://localhost:8088/artifactory'
-    @Shared sourceArtifactory = create(sourceBaseurl, 'admin', 'password')
+    @Shared sourceArtifactory = ArtifactoryClientBuilder.create().setUrl(sourceBaseurl)
+            .setUsername('admin').setPassword('password').build()
 
     static final targetBaseurl = 'http://localhost:8081/artifactory'
-    @Shared targetArtifactory = create(targetBaseurl, 'admin', 'password')
+    @Shared targetArtifactory = ArtifactoryClientBuilder.create().setUrl(targetBaseurl)
+            .setUsername('admin').setPassword('password').build()
 
     def 'maven repo migration test'() {
         setup:
@@ -45,7 +48,7 @@ class ArtifactoryMigrationHelperTest extends Specification {
         def targetMavenVirtual = getRepo(targetArtifactory, MAVEN_VIRTUAL_KEY)
         then:
         targetMavenLocal != null
-        targetMavenLocal.repositorySettings.packageType == PackageType.maven
+        targetMavenLocal.repositorySettings.packageType == PackageTypeImpl.maven
         targetMavenRemote != null
         targetMavenVirtual != null
 
@@ -83,7 +86,7 @@ class ArtifactoryMigrationHelperTest extends Specification {
         def targetDockerLocal = getRepo(targetArtifactory, DOCKER_LOCAL_KEY)
         then:
         targetDockerLocal != null
-        targetDockerLocal.repositorySettings.packageType == PackageType.docker
+        targetDockerLocal.repositorySettings.packageType == PackageTypeImpl.docker
 
         // Check docker repo replication was set
         when:
@@ -168,6 +171,6 @@ class ArtifactoryMigrationHelperTest extends Specification {
             .apiUrl("api/replications/$key")
             .method(ArtifactoryRequest.Method.GET)
             .responseType(ArtifactoryRequest.ContentType.JSON)
-        return artifactory.restCall(getReplications)
+        return new JsonSlurper().parseText(artifactory.restCall(getReplications).getRawBody())
     }
 }

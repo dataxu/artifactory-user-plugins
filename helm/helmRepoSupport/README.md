@@ -1,6 +1,8 @@
 Artifactory Helm Repo Support User Plugin
 =========================================
 
+**This plugin is deprecated as of Artifactory v5.8.0 and will not be tested against newer versions. Instead you should use the built-in support to Helm repositories. For more information on how to configure Helm repositories in Artifactory check the [wiki page](https://www.jfrog.com/confluence/display/RTF/Helm+Chart+Repositories).**
+
 HelmRepoSupport is only supported from version 4.x
 
 HelmRepoSupport is a user plugin for Artifactory.

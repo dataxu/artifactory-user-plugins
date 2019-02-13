@@ -30,26 +30,34 @@ import org.artifactory.build.BuildRun
 import org.artifactory.build.Builds
 import org.artifactory.build.DetailedBuildRun
 import org.artifactory.build.DetailedBuildRunImpl
+import org.artifactory.build.InternalBuildService
+import org.artifactory.concurrent.ArtifactoryRunnable
 import org.artifactory.exception.CancelException
 import org.artifactory.storage.build.service.BuildStoreService
 import org.artifactory.storage.db.DbService
 import org.artifactory.util.HttpUtils
 import org.jfrog.build.api.Build
 import org.slf4j.Logger
+import org.artifactory.search.Searches
 
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 
 import static groovyx.net.http.ContentType.BINARY
 import static groovyx.net.http.ContentType.JSON
+import static groovyx.net.http.ContentType.TEXT
 import static groovyx.net.http.Method.DELETE
 import static groovyx.net.http.Method.PUT
+import static groovyx.net.http.Method.POST
 
 import java.util.List
 import org.apache.http.impl.client.AbstractHttpClient
 import org.apache.http.impl.client.DefaultHttpClient
 import org.apache.http.impl.conn.PoolingClientConnectionManager
 import org.apache.http.params.HttpParams
+import org.artifactory.request.RequestThreadLocal
+
+import org.springframework.security.core.context.SecurityContextHolder
 
 /**
  * Build Synchronization plugin replicates some build info json from one
@@ -170,11 +178,13 @@ executions {
             def forceS = params?.get('force')?.get(0) as String
             boolean force = forceS ? (forceS == "1" || forceS == "true") : false
             PullConfig pullConf = baseConf.pullConfigs[confKey]
+
             def res = doSync(
                 new RemoteBuildService(pullConf.source, log, baseConf.ignoreStartDate),
                 new LocalBuildService(ctx, log, pullConf.reinsert, pullConf.activatePlugins, baseConf.ignoreStartDate),
                 pullConf.buildNames,
-                pullConf.delete, max, force, baseConf.maxThreads
+                pullConf.delete, max, force, baseConf.maxThreads, baseConf.ignoreStartDate,
+                pullConf.syncPromotions
             )
             if (!res) {
                 status = 404
@@ -209,15 +219,15 @@ executions {
             def forceS = params?.get('force')?.get(0) as String
             boolean force = forceS ? (forceS == "1" || forceS == "true") : false
             PushConfig pushConf = baseConf.pushConfigs[confKey]
-            def localBuildService = new LocalBuildService(ctx, log, false, false, baseConf.ignoreStartDate)
 
             List<String> res = []
             pushConf.destinations.each { destServer ->
                 res.addAll(doSync(
-                    localBuildService,
+                    new LocalBuildService(ctx, log, false, false, baseConf.ignoreStartDate),
                     new RemoteBuildService(destServer, log, baseConf.ignoreStartDate),
                     pushConf.buildNames,
-                    pushConf.delete, 0, force, baseConf.maxThreads
+                    pushConf.delete, 0, force, baseConf.maxThreads, baseConf.ignoreStartDate,
+                    pushConf.syncPromotions
                 ))
             }
             if (!res) {
@@ -230,7 +240,7 @@ executions {
             }
         } catch (Exception e) {
             // aborts during execution
-            log.error("Failed pull config", e)
+            log.error("Failed push config", e)
             status = 500
             message = e.message
         }
@@ -239,6 +249,17 @@ executions {
 
 build {
     afterSave { buildRun ->
+        try {
+            def request = RequestThreadLocal.getRequest()?.getRequest()
+            def propagate = request?.getParameter('propagate')
+            if ('false' == propagate) {
+                // Avoid sync loops by not firing event-base push for builds created by the plugin
+                log.debug "Build request set to not propagate."
+                return
+            }
+        } catch (MissingMethodException e) {
+            log.warn "Artifactory 4.x or older does not support event push Build replication loop"
+        }
         log.debug "Checking if ${buildRun.name} should be pushed!"
         def baseConf = baseConfHolder.getCurrent()
         if (!baseConfHolder.errors) {
@@ -275,23 +296,26 @@ def pushIfMatch(DetailedBuildRunImpl buildRun, PushConfig pushConf, String build
     }
 }
 
-def doSync(BuildListBase src, BuildListBase dest, List<String> buildNames, boolean delete, int max, boolean force, int maxThreads) {
+def doSync(BuildListBase src, BuildListBase dest, List<String> buildNames, boolean delete,
+    int max, boolean force, int maxThreads, boolean ignoreStartDate, boolean syncPromotions) {
     List res = []
     NavigableSet<BuildRun> buildNamesToSync = src.filterBuildNames(buildNames)
     def buildThreadPool = Executors.newFixedThreadPool(maxThreads)
     def set = max == 0 ? buildNamesToSync : buildNamesToSync.descendingSet()
-
+    def authctx = SecurityContextHolder.context.authentication
     try {
         set.each { BuildRun srcBuild ->
-            if (!force && srcBuild.started && srcBuild.started == dest.getLastStarted(srcBuild.name)) {
+            if (!force && !syncPromotions && srcBuild.started && srcBuild.started == dest.getLastStarted(srcBuild.name)) {
                 log.debug "Build ${srcBuild} is already sync!"
                 res << "${srcBuild.name}:already-synched"
             } else {
                 String buildName = srcBuild.name
-                def srcBuilds = src.getBuildNumbers(buildName)
-                def destBuilds = dest.getBuildNumbers(buildName)
+                def srcBuilds = src.getBuildNumbers(buildName, syncPromotions)
+                def destBuilds = dest.getBuildNumbers(buildName, syncPromotions)
                 def common = srcBuilds.intersect(destBuilds)
                 log.info "Found ${common.size()} identical builds"
+                def srcCommonBuilds = common.intersect(srcBuilds)
+                def destCommonBuilds = common.intersect(destBuilds)
                 destBuilds.removeAll(common)
                 srcBuilds.removeAll(common)
                 int added = 0
@@ -300,14 +324,38 @@ def doSync(BuildListBase src, BuildListBase dest, List<String> buildNames, boole
                 def futures = srcBuilds.collect { sb ->
                     if (max == 0 || submitted < max) {
                         submitted++
-                        buildThreadPool.submit( {
+                        def task = [run:{
                             Build buildInfo = src.getBuildInfo(sb)
                             if (buildInfo) {
                                 dest.addBuild(buildInfo)
                             }
-                        } as Callable)
+                        }] as Runnable
+                        buildThreadPool.submit(new ArtifactoryRunnable(task, ctx, authctx))
                     }
                 }
+
+                // Handle promotions change
+                if (syncPromotions) {
+                    common.each { b ->
+                        def sb = srcCommonBuilds.find { it == b }
+                        def db = destCommonBuilds.find { it == b }
+                        if (sb.promotions != db.promotions) {
+                            log.info "Found promotions change for build $sb"
+                            if (max == 0 || submitted < max) {
+                                submitted++
+                                def task = [run:{
+                                    Build buildInfo = src.getBuildInfo(sb)
+                                    if (buildInfo) {
+                                        dest.deleteBuild(db)
+                                        dest.addBuild(buildInfo)
+                                    }
+                                }] as Runnable
+                                futures << buildThreadPool.submit(new ArtifactoryRunnable(task, ctx, authctx))
+                            }
+                        }
+                    }
+                }
+
                 futures.each { future ->
                     if (future) {
                         future.get()
@@ -331,7 +379,7 @@ def doSync(BuildListBase src, BuildListBase dest, List<String> buildNames, boole
 
 abstract class BuildListBase {
     def log
-    boolean ignoreStartDate = false
+    boolean ignoreStartDate = true
     private NavigableSet<BuildRun> _allLatestBuilds = null
 
     BuildListBase(log, ignoreStartDate) {
@@ -348,12 +396,18 @@ abstract class BuildListBase {
 
     abstract NavigableSet<BuildRun> loadAllBuilds()
 
-    protected BuildRun createBuildRunFromJson(String name, String number, String started) {
-        new BuildRunImpl(name, number, started, ignoreStartDate)
+    protected BuildRun createBuildRunFromJson(name, number, started, promotions = null) {
+        TreeSet<Promotion> promotionStatus = new TreeSet<>()
+        if (promotions != null) {
+            promotions.each {
+                promotionStatus << new Promotion(it['build.promotion.status'], it['build.promotion.created'] as String)
+            }
+        }
+        new BuildRunImpl(name, number, started, ignoreStartDate, promotionStatus)
     }
 
     protected BuildRun createBuildRunFromDetailed(BuildRun br) {
-        new BuildRunImpl(br.getName(), br.getNumber(), br.getStarted(), ignoreStartDate)
+        new BuildRunImpl(br.getName(), br.getNumber(), br.getStarted(), ignoreStartDate, new TreeSet<>())
     }
 
     NavigableSet<BuildRun> filterBuildNames(List<String> buildNames) {
@@ -377,7 +431,7 @@ abstract class BuildListBase {
         getAllLatestBuilds().find { it.name == buildName }?.started
     }
 
-    abstract NavigableSet<BuildRun> getBuildNumbers(String buildName)
+    abstract NavigableSet<BuildRun> getBuildNumbers(String buildName, boolean includePromotions)
 
     abstract Build getBuildInfo(BuildRun b)
 
@@ -463,15 +517,38 @@ class RemoteBuildService extends BuildListBase {
     }
 
     @Override
-    NavigableSet<BuildRun> getBuildNumbers(String buildName) {
+    NavigableSet<BuildRun> getBuildNumbers(String buildName, boolean includePromotions) {
         lastFailure = null
         Set<BuildRun> result = new TreeSet<>()
         log.info "Getting all build numbers from ${server.url}api/build/$buildName"
-        http.get(contentType: JSON, path: "api/build/$buildName") { resp, json ->
-            json.buildsNumbers.each { b ->
-                result << createBuildRunFromJson(buildName,
-                    HttpUtils.decodeUri(b.uri.substring(1)),
-                    b.started as String)
+        if (!includePromotions) {
+            http.get(contentType: JSON, path: "api/build/$buildName") { resp, json ->
+                json.buildsNumbers.each { b ->
+                    result << createBuildRunFromJson(buildName,
+                            HttpUtils.decodeUri(b.uri.substring(1)),
+                            b.started as String)
+                }
+            }
+        } else {
+            http.request(POST) {
+                uri.path = "api/search/aql"
+                requestContentType = TEXT
+                contentType = JSON
+                body = "builds.find({\"name\":{\"\$eq\":\"$buildName\"}}).include(\"promotion\")"
+                response.success = { resp, json ->
+
+                    if (json.results && !json.results[0].containsKey('build.date') && !ignoreStartDate) {
+                        def msg = "Server ${server.url} does not support promotions sync with ignoreStartDate set to false"
+                        throw new CancelException(msg, 409)
+                    }
+
+                    json.results.each { b ->
+                        result << createBuildRunFromJson(buildName,
+                                b['build.number'],
+                                b.containsKey('build.date') ? b['build.date'] as String : b['build.created'] as String,
+                                b['build.promotions'])
+                    }
+                }
             }
         }
         if (lastFailure != null) {
@@ -491,7 +568,10 @@ class RemoteBuildService extends BuildListBase {
     Build getBuildInfo(BuildRun b) {
         lastFailure = null
         def uri = "api/build/${b.name}/${b.number}"
-        Map<String, String> queryParams = [started: b.started]
+        def queryParams = [:]
+        if (!ignoreStartDate) {
+            queryParams << [started: b.started]
+        }
         log.info "Downloading JSON build info ${server.url}$uri ${queryParams}"
         Build res = null
         http.get(contentType: BINARY,
@@ -515,6 +595,8 @@ class RemoteBuildService extends BuildListBase {
         lastFailure = null
         http.request(PUT, JSON) {
             uri.path = "api/build"
+            // Avoid sync loops by not firing event-base push for builds created by the plugin
+            uri.query = [propagate: 'false']
             // JsonGenerator jsonGenerator = JacksonFactory.createJsonGenerator(outputStream)
             // jsonGenerator.writeObject(buildInfo)
             body = buildInfo
@@ -534,6 +616,9 @@ class RemoteBuildService extends BuildListBase {
         http.request(DELETE, JSON) {
             uri.path = "api/build/${buildRun.name}"
             uri.query = [buildNumbers: buildRun.number, artifacts: 0, deleteAll: 0]
+            if (!ignoreStartDate) {
+                uri.query << [started: buildRun.started]
+            }
             response.success = {
                 log.info "Successfully deleted build ${buildRun.name}/${buildRun.number}"
             }
@@ -548,9 +633,11 @@ class RemoteBuildService extends BuildListBase {
 class LocalBuildService extends BuildListBase {
     DbService dbService
     BuildStoreService buildStoreService
+    InternalBuildService buildService
     AddonsManager addonsManager
     PluginsAddon pluginsAddon
     Builds builds
+    Searches searches
     boolean reinsert
     boolean activatePlugins
 
@@ -560,7 +647,9 @@ class LocalBuildService extends BuildListBase {
         addonsManager = ctx.beanForType(AddonsManager.class)
         pluginsAddon = addonsManager.addonByType(PluginsAddon.class)
         buildStoreService = ctx.beanForType(BuildStoreService.class)
+        buildService = ctx.beanForType(InternalBuildService.class)
         builds = ctx.beanForType(Builds.class)
+        searches = ctx.beanForType(Searches.class)
         this.reinsert = reinsert
         this.activatePlugins = activatePlugins
     }
@@ -576,9 +665,27 @@ class LocalBuildService extends BuildListBase {
     }
 
     @Override
-    NavigableSet<BuildRun> getBuildNumbers(String buildName) {
+    NavigableSet<BuildRun> getBuildNumbers(String buildName, boolean includePromotions) {
         def res = new TreeSet<BuildRun>()
-        res.addAll(buildStoreService.findBuildsByName(buildName).collect { createBuildRunFromDetailed(it) })
+        if (!includePromotions) {
+            res.addAll(buildStoreService.findBuildsByName(buildName).collect { createBuildRunFromDetailed(it) })
+        } else {
+            def aqlQuery = "builds.find({\"name\":{\"\$eq\":\"$buildName\"}}).include(\"promotion\")"
+            searches.aql(aqlQuery) { result ->
+                def index = 0
+                result.each { b ->
+                    if (index == 0 && !b.containsKey('build.date') && !ignoreStartDate) {
+                        def msg = "This server does not support promotions sync with ignoreStartDate set to false"
+                        throw new CancelException(msg, 409)
+                    }
+                    index++
+                    res << createBuildRunFromJson(buildName,
+                            b['build.number'],
+                            b.containsKey('build.date') ? b['build.date'] as String : b['build.created'] as String,
+                            b['build.promotions'])
+                }
+            }
+        }
         log.info "Found ${res.size()} local builds named $buildName"
         res
     }
@@ -597,7 +704,7 @@ class LocalBuildService extends BuildListBase {
                         if (activatePlugins) {
                             pluginsAddon.execPluginActions(BeforeBuildSaveAction.class, builds, detailedBuildRun)
                         }
-                        buildStoreService.addBuild(buildInfo)
+                        buildService.addBuild(buildInfo)
                         if (activatePlugins) {
                             pluginsAddon.execPluginActions(AfterBuildSaveAction.class, builds, detailedBuildRun)
                         }
@@ -613,18 +720,36 @@ class LocalBuildService extends BuildListBase {
 
     @Override
     def deleteBuild(BuildRun buildRun) {
-        try {
-            log.info "Deleting local build $buildRun"
-            builds.deleteBuild(buildRun)
-        } catch (Exception e) {
-            String message = "Deletion of build ${buildRun} failed due to: ${e.getMessage()}"
-            log.warn(message, e)
+        if (ignoreStartDate) {
+            def buildRuns = builds.getBuilds(buildRun.name, buildRun.number, null)
+            buildRuns.each { builds.deleteBuild(it) }
+        } else {
+            try {
+                log.info "Deleting local build $buildRun"
+                builds.deleteBuild(buildRun)
+            } catch (Exception e) {
+                String message = "Deletion of build ${buildRun} failed due to: ${e.getMessage()}"
+                log.warn(message, e)
+            }
         }
     }
 
     @Override
     Build getBuildInfo(BuildRun b) {
-        return buildStoreService.getBuildJson(b)
+        if (!ignoreStartDate) {
+            try {
+                return buildService.getBuild(b)
+            } catch (MissingMethodException ex) {
+                return buildStoreService.getBuildJson(b)
+            }
+        } else {
+            def buildRuns = builds.getBuilds(b.name, b.number, null)
+            try {
+                return buildService.getBuild(buildRuns[0])
+            } catch (MissingMethodException ex) {
+                return buildStoreService.getBuildJson(buildRuns[0])
+            }
+        }
     }
 }
 
@@ -769,6 +894,7 @@ class PullConfig {
     boolean delete
     boolean reinsert
     boolean activatePlugins
+    boolean syncPromotions
 
     PullConfig(def slurp, Map<String, Server> servers) {
         key = slurp.key
@@ -778,6 +904,7 @@ class PullConfig {
         delete = slurp.delete as boolean
         reinsert = slurp.reinsert as boolean
         activatePlugins = slurp.activatePlugins as boolean
+        syncPromotions = slurp.syncPromotions as boolean
     }
 
     def isInvalid(BaseConfiguration conf) {
@@ -801,6 +928,7 @@ class PushConfig {
     List<String> buildNames = []
     boolean delete
     boolean activateOnSave
+    boolean syncPromotions
 
     PushConfig(def slurp, Map<String, Server> servers) {
         key = slurp.key
@@ -813,6 +941,7 @@ class PushConfig {
         buildNames = slurp.buildNames as List
         delete = slurp.delete as boolean
         activateOnSave = slurp.activateOnSave as boolean
+        syncPromotions = slurp.syncPromotions as boolean
     }
 
     def isInvalid(BaseConfiguration conf) {
@@ -833,8 +962,9 @@ class BuildRunImpl implements BuildRun, Comparable<BuildRun> {
     private final String name;
     private final String number;
     private final String started;
+    private final SortedSet<Promotion> promotions;
 
-    BuildRunImpl(String name, String number, String started, boolean ignoreStartDate) {
+    BuildRunImpl(String name, String number, String started, boolean ignoreStartDate, SortedSet<Promotion> promotions) {
         this.ignoreStartDate = ignoreStartDate;
         this.name = name;
         this.number = number;
@@ -843,6 +973,7 @@ class BuildRunImpl implements BuildRun, Comparable<BuildRun> {
         } else {
             this.started = "";
         }
+        this.promotions = promotions;
     }
 
     @Override
@@ -873,6 +1004,10 @@ class BuildRunImpl implements BuildRun, Comparable<BuildRun> {
     @Override
     public String getReleaseStatus() {
         return null;
+    }
+
+    public SortedSet<Promotion> getPromotions() {
+        return promotions;
     }
 
     @Override
@@ -919,6 +1054,59 @@ class BuildRunImpl implements BuildRun, Comparable<BuildRun> {
 
     @Override
     public String toString() {
-        return "" + name + ':' + number + ':' + started;
+        return "" + name + ':' + number + ':' + started + ':' + promotions;
+    }
+}
+
+class Promotion implements Comparable<Promotion>{
+
+    private final String status;
+    private final String created;
+
+    public Promotion(String status, String created) {
+        this.status = status;
+        this.created = created;
+    }
+
+    public String getStatus() {
+        return status;
+    }
+
+    public String getCreated() {
+        return created;
+    }
+
+    @Override
+    public int compareTo(Promotion o) {
+        int i = getCreated().compareTo(o.getCreated());
+        if (i != 0) {
+            return i;
+        }
+        return getStatus().compareTo(o.getStatus());
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) { return true; }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        Promotion promotion = (Promotion) o;
+        if (status != null ? !status.equals(promotion.status) : promotion.status != null) {
+            return false;
+        }
+        return created != null ? created.equals(promotion.created) : promotion.created == null;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = status != null ? status.hashCode() : 0;
+        result = 31 * result + (created != null ? created.hashCode() : 0);
+        return result;
+    }
+
+    @Override
+    public String toString() {
+        return "" + status + ":" + created;
     }
 }

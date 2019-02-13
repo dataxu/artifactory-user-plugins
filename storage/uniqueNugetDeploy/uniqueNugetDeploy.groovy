@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-import com.sun.jersey.core.util.MultivaluedMapImpl
 import org.artifactory.addon.nuget.rest.NuGetRequestContext
 import org.artifactory.addon.nuget.search.delegate.packages.PackageEntryRequestDelegate
 import org.artifactory.exception.CancelException
@@ -86,7 +85,7 @@ storage {
         def urlid = "(Id='$id',Version='$ver')"
         def repoService = ctx.beanForType(InternalRepositoryService.class)
         def ps3 = new LinkedMultiValueMap()
-        def ps4 = new MultivaluedMapImpl()
+        def ps4 = new MultivaluedHashMap()
         def context = new NuGetRequestContext()
         try {
             context.uriInfo = new FakeUriInfo(ps4)
@@ -98,7 +97,12 @@ storage {
         } catch (MissingPropertyException ex) {}
         if (ngsps4 != null) {
             def params = [ps4] as Object[]
-            context.nuGetSearchParameters = ngsps4.newInstance(params)
+            try {
+                context.nuGetSearchParameters = ngsps4.newInstance(params)
+            } catch (GroovyRuntimeException e) {
+                params = [ps4, true] as Object[]
+                context.nuGetSearchParameters = ngsps4.newInstance(params)
+            }
         } else {
             def params = [ps3, ''] as Object[]
             context.nuGetSearchParameters = ngsps3.newInstance(params)

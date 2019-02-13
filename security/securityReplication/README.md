@@ -1,6 +1,9 @@
 Artifactory Security Replication User Plugin
 ============================================
 
+**&ast;&ast;&ast; *Deprecation NOTICE* &ast;&ast;&ast;**  
+*With the release of the [Access Federation](https://www.jfrog.com/confluence/display/RTF/Access+Federation) feature of the Enterprise Plus Package of JFrog Artifactory, the Security Replication plugin has been deprecated.  Accordingly, support for Security Replication is not being carried forward for versions of JFrog Artifactory 6.x and beyond.  Please contact your account manager or JFrog Support if you are using this plugin or if you need its capability.*
+
 **&ast;&ast;&ast; IMPORTANT &ast;&ast;&ast;**  
 *If you are upgrading to Artifactory 5.6 or higher, please read the upgrade
 instructions [below](#upgrading). Failure to do so may result in destruction of
@@ -19,9 +22,10 @@ changes in the security data, and syncs those changes to the other instances.
 For this reason, changes made may not synchronize immediately.
 
 Replicated security data includes all users, groups, and permissions, and all
-associated data, including user passwords, API keys, OAuth keys, etc. It is
-possible to restrict this to only users, or only users and groups, rather than
-all three. This can be done in the configuration file, as specified below.
+associated data, including user passwords, API keys, OAuth keys, etc (Note that
+JFrog Access tokens are not replicated). It is possible to restrict this to only
+users, or only users and groups, rather than all three. This can be done in the
+configuration file, as specified below.
 
 Upgrading
 ---------
@@ -111,7 +115,7 @@ This file takes the following information:
   synchronization occurs. Changes to this will not take effect until after the
   plugin is reloaded or Artifactory is restarted.
 - `safety`: By default, replication will not run when the Artifactory version is
-  behind the plugin version. This means that each time Artifactory is upgraded,
+  ahead of the plugin version. This means that each time Artifactory is upgraded,
   the plugin must also be updated. This is a safety measure to prevent
   accidental data loss due to incompatibilities between Artifactory and
   securityReplication. You may disable this behavior by including a `safety`
@@ -167,12 +171,17 @@ each of those instances:
 curl -uadmin:password -XPOST http://localhost:8088/artifactory/api/plugins/execute/distSecRep
 ```
 
+If possible, it may be best to call `distSecRep` directly on the HA node with
+the new config file, rather than going through the load balancer. This ensures
+that the correct config is distributed properly.
+
 At this point, any HA instances may need their plugin lists refreshed manually,
 for each node in the instance.
 
 Now, the plugin should be properly configured and running on all instances. You
 can easily confirm by temporarily [enabling the debug log][log] and confirming
-in `artifactory.log`.
+in `artifactory.log`, and/or by running the validation endpoint, as described
+below.
 
 [log]: https://github.com/JFrogDev/artifactory-user-plugins/tree/master/security/securityReplication#logging
 
@@ -295,6 +304,17 @@ Issues and Limitations
   be too much of a problem, considering the plugin ensures that all users exist
   with the same properties on all instances, but it still might be preferred to
   have this option available.
+- If, for example, a permission target refers to a repository "test-repo", and
+  this repository exists on site A but not on site B, the permission will still
+  be replicated, and will simply refer to the nonexistant repository. If a
+  repository "test-repo" was later created on site B, the permission should now
+  grant privileges on this new repository. However, if "test-repo" is a remote
+  repository, the permission will not be able to grant privileges, because it
+  refers to "test-repo" and not "test-repo-cache" (all remote privileges are
+  granted on remote caches). To fix this, the permission must be edited and
+  re-saved, even if no changes are made to it; this triggers Artifactory to fix
+  the repository name automatically. This issue does not occur if the repository
+  already exists before the permission is first replicated.
 - When upgrading the plugin itself, do not refresh the plugin lists while the
   plugin's sync job is running. Doing this can cause the plugin to stop working
   entirely. If this happens, Artifactory must be restarted.

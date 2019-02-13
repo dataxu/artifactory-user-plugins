@@ -1,13 +1,4 @@
-import groovy.json.JsonBuilder
-import groovy.transform.Field
-import org.artifactory.api.common.BasicStatusHolder
-import org.artifactory.api.build.BuildService
-import org.artifactory.exception.CancelException
-import static com.google.common.collect.Multimaps.forMap
 import org.artifactory.repo.RepoPath
-import com.google.common.collect.HashMultimap
-import com.google.common.collect.SetMultimap
-import org.artifactory.search.*
 import org.artifactory.search.aql.AqlResult
 import org.artifactory.repo.RepoPathFactory
 
@@ -23,13 +14,14 @@ executions {
         propertyName = params?.get('propertyName')?.get(0) as String
         propertyValue = params?.get('propertyValue')?.get(0) as int
         repo = params?.get('repo')?.get(0) as String
-        fileCleanup(propertyName, propertyValue, repo)
+        dryRun = new Boolean(params?.get('dryRun')?.get(0))
+        fileCleanup(propertyName, propertyValue, repo, dryRun)
     }
 }
 
 
 
-private def fileCleanup(propertyName, propertyValue, repo) {
+private def fileCleanup(propertyName, propertyValue, repo, dryRun) {
     log.info "Looking for files with property of $propertyName with a value lower than $propertyValue... in $repo"
 
     def count = 0
@@ -44,15 +36,17 @@ private def fileCleanup(propertyName, propertyValue, repo) {
             def keyValue = repositories.getProperty(repoPath, propertyName)
             log.info "$propertyName: $keyValue"
             if (keyValue.toInteger() < propertyValue) {
-                log.info "Deleting $repoPath"
-                repositories.delete repoPath
+                log.info "Deleting $repoPath (dryRun: $dryRun)"
+                if (!dryRun) {
+                    repositories.delete repoPath
+                }
                 count++
             }
         }
     }
     if (count > 0){
-        log.info ("Succesfully deleted  " + count + " files")
+        log.info ("Succesfully deleted  $count files (dryRun: $dryRun)")
     } else
-        log.info ("No files with property: '" + propertyName + "' and property value less than '" + propertyValue +"' found. Did not delete anything")
+        log.info ("No files with property: '$propertyName' and property value less than '$propertyValue' found. Did not delete anything")
     status = 200
 }

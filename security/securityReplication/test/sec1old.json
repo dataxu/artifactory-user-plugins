@@ -66,7 +66,7 @@
                 "**"
             ],
             "repos": [
-                "jcenter-cache"
+                "jcenter"
             ]
         },
         "deleteme": {
@@ -77,7 +77,7 @@
                 "**"
             ],
             "repos": [
-                "jcenter-cache"
+                "jcenter"
             ]
         }
     },
@@ -104,32 +104,6 @@
             "publickey": null,
             "salt": "CAFEBABEEBABEFAC",
             "updatable": true
-        },
-        "anonymous": {
-            "admin": false,
-            "bintray": null,
-            "email": null,
-            "enabled": true,
-            "expired": false,
-            "groups": [
-                
-            ],
-            "locked": false,
-            "passkey": null,
-            "password": "d41d8cd98f00b204e9800998ecf8427e",
-            "permissions": {
-                "Any Remote": "rw",
-                "Anything": "r",
-                "changeme": "dmnrw",
-                "deleteme": "dmnrw"
-            },
-            "privatekey": null,
-            "properties": {
-                
-            },
-            "publickey": null,
-            "salt": null,
-            "updatable": false
         },
         "changeme": {
             "admin": false,

@@ -1,9 +1,9 @@
 import spock.lang.Specification
 import org.jfrog.artifactory.client.model.repository.settings.impl.MavenRepositorySettingsImpl
 import org.jfrog.artifactory.client.model.repository.settings.impl.IvyRepositorySettingsImpl
-import org.jfrog.pluginsdevenv.Control
+import org.jfrog.lilypad.Control
 
-import static org.jfrog.artifactory.client.ArtifactoryClient.create
+import org.jfrog.artifactory.client.ArtifactoryClientBuilder
 
 class Pom2ivyTest extends Specification {
     def 'simple pom to ivy plugin test'() {
@@ -12,7 +12,8 @@ class Pom2ivyTest extends Specification {
         moveAntJars()
 
         def baseurl = 'http://localhost:8088/artifactory'
-        def artifactory = create(baseurl, 'admin', 'password')
+        def artifactory = ArtifactoryClientBuilder.create().setUrl(baseurl)
+            .setUsername('admin').setPassword('password').build()
 
         def builder = artifactory.repositories().builders()
         def ivy = builder.localRepositoryBuilder().key('ivy-local')
@@ -49,12 +50,12 @@ class Pom2ivyTest extends Specification {
 
     private moveAntJars() {
         def src = './src/test/groovy/Pom2ivyTest/'
-        def dst = '/var/opt/jfrog/artifactory/tomcat/webapps/artifactory/WEB-INF/lib/'
+        def dst = '/opt/jfrog/artifactory/tomcat/webapps/artifactory/WEB-INF/lib/'
         def jar1 = 'ant-1.8.3.jar', jar2 = 'ant-launcher-1.8.3.jar'
         Control.setFileContent(8088, dst + jar1, new File(src + jar1))
         Control.setFileContent(8088, dst + jar2, new File(src + jar2))
         Control.stop(8088)
         Control.resume(8088)
-        System.sleep(5000)
+        System.sleep(8000)
     }
 }

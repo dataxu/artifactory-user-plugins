@@ -5,7 +5,7 @@ import artifactory.SecurityTestApi
 import common.ArtUsers
 import devenv.ArtifactoryManager
 import groovy.json.JsonSlurper
-import groovyx.net.http.HttpResponseException
+import org.apache.http.client.HttpResponseException
 import org.apache.http.HttpException
 import org.jfrog.artifactory.client.ArtifactoryRequest
 import org.jfrog.artifactory.client.impl.ArtifactoryRequestImpl
@@ -22,6 +22,7 @@ abstract class BaseSpec extends Specification {
     static public artifactory = []
     boolean testGroupReplication = false
     boolean testPermissionReplication = false
+
 
     //
     // pre-popluate 3 artifactory instances with default set of Repositories, Groups, Permissions and Users.
@@ -104,7 +105,7 @@ abstract class BaseSpec extends Specification {
             .method(ArtifactoryRequest.Method.GET)
             .responseType(ArtifactoryRequest.ContentType.TEXT)
         try {
-             def response = new JsonSlurper().parseText(art.restCall(configRequest).toString())
+             def response = new JsonSlurper().parseText(art.restCall(configRequest).getRawBody())
              filter = response.securityReplication.filter
         } catch (HttpResponseException hre) {
             System.out.println("Could not retrieve the security replication configuration from ${art.getUri()}. Status: ${hre.getStatusCode()}, ${hre.getMessage()}")
@@ -152,12 +153,14 @@ abstract class BaseSpec extends Specification {
         per.createPermissionDefault()
     }
 
+
     def setupArtifactory () {
         artifactory = new ArtifactoryManager().getArtifactoryInstances() as Artifactory[]
         masterHA = artifactory[0] as Artifactory
         node1HA = artifactory[1] as Artifactory
         node2Pro = artifactory[2] as Artifactory
     }
+
 /*
     def cleanupSpec() {
         setup:
