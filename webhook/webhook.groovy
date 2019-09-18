@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011 JFrog Ltd.
+ * Copyright (C) 2018 JFrog Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+import com.google.common.collect.BiMap
+import com.google.common.collect.ImmutableBiMap
 import groovy.json.JsonBuilder
 import groovy.json.JsonSlurper
 import java.util.regex.Pattern
@@ -23,7 +25,7 @@ import java.util.concurrent.Executors
  * Webhook for Artifactory
  *
  * This webhook includes the following components
- * 1. webook.groovy - main script, modify only if needing to change functionality
+ * 1. webhook.groovy - main script, modify only if needing to change functionality
  * 2. webhook.config.json - specify the target url and event to trigger webhook
  *
  * Installation:
@@ -77,6 +79,9 @@ class Globals {
         ],
         slack: [
             description: "A POST formatted specifically for Slack", formatter: new SlackFormatter ( )
+        ],
+        spinnaker: [
+                description: "A POST formatted specifically for Spinnaker", formatter: new SpinnakerFormatter ()
         ]
     ]
 
@@ -99,12 +104,33 @@ class Globals {
         def idx = event.indexOf('.')
         return SUPPORT_MATRIX[event.substring(0, idx)][event.substring(idx + 1)]
     }
+    enum PackageTypeEnum {
+        HELM("helm/chart"),
+        DOCKER ("docker/image")
+
+        private String value
+
+        PackageTypeEnum(String value) {
+            this.value = value
+        }
+
+        String toString() {
+            return value;
+        }
+    }
+    static final BiMap<String, PackageTypeEnum> PACKAGE_TYPE_MAP = new ImmutableBiMap.Builder<String, PackageTypeEnum>()
+            .put("helm", PackageTypeEnum.HELM)
+            .put("docker", PackageTypeEnum.DOCKER)
+            .build()
+    static repositories
 }
 
 /**
  * REST APIs for the webhook
  */
 executions {
+
+    Globals.repositories = repositories
 
     /**
      * Simple PING event to test endpoint
@@ -279,6 +305,81 @@ class ResponseFormatter {
 }
 
 /**
+ * Spinnaker formatter
+ */
+class SpinnakerFormatter {
+    def format(String event, JsonBuilder data) {
+        def eventTypeMetadata = Globals.eventToSupported(event)
+        def builder = new JsonBuilder()
+        def json = data.content
+
+        if (Globals.SUPPORT_MATRIX.storage.afterCreate.name == eventTypeMetadata.name) {
+            def type = getPackageType(json.repoKey)
+
+            if(Globals.PackageTypeEnum.HELM.toString() == type) {
+                def nameVersionDetails = getHelmPackageNameAndVersion(json)
+                builder {
+                    artifacts(
+                            [
+                                [
+                                    type     : type,
+                                    name     : nameVersionDetails.name,
+                                    version  : nameVersionDetails.version,
+                                    reference: "${WebHook.baseUrl()}/${json.repoKey}/${json.relPath}"
+                                ]
+                            ]
+                    )
+                }
+            }else{
+                builder {
+                    text "Artifactory: ${eventTypeMetadata['humanName']} event is only support for HELM repository by Spinnaker formatter"
+                }
+            }
+        }else if (Globals.SUPPORT_MATRIX.docker.tagCreated.name == eventTypeMetadata.name) {
+            builder {
+                artifacts(
+                     [
+                         [
+                                 type: getPackageType(json.event.repoKey),
+                                 name: json.docker.image,
+                                 version: json.docker.tag,
+                                 reference: "${WebHook.baseUrl()}/${json.event.repoKey}/${json.docker.image}:${json.docker.tag}"
+                         ]
+                     ]
+                )
+            }
+        } else{
+            builder {
+                text "Artifactory: ${eventTypeMetadata['humanName']} event is not supported by Spinnaker formatter"
+            }
+        }
+        return builder
+    }
+
+    def getPackageType(repoKey) {
+        def repoInfo = Globals.repositories.getRepositoryConfiguration(repoKey)
+        def packageType = Globals.PACKAGE_TYPE_MAP.get(repoInfo.getPackageType()).toString()
+        return packageType
+    }
+
+    def getHelmPackageNameAndVersion(json) {
+        def map
+        String name = null
+        String version = null
+        if (json.name) {
+            def m = (json.name.split(/\-\d+\./))
+
+            if (m && m.size() > 1) {
+                name = m[0]
+                version = json.name.substring(name.length() + 1, json.name.lastIndexOf('.'))
+            }
+        }
+        map = [name: name, version: version]
+        return map
+    }
+}
+
+/**
  * Slack formatter
  */
 class SlackFormatter {
@@ -434,6 +535,7 @@ class WebHook {
     def triggers = new HashMap()
     def debug = false
     def connectionTimeout = 15000
+    def baseUrl
     // Used for async POSTS
     ExecutorService excutorService = Executors.newFixedThreadPool(10)
 
@@ -473,6 +575,14 @@ class WebHook {
     }
 
     /**
+     * Get the baseUrl value
+     * @return value if the baseUrl value is set
+     */
+    static String baseUrl() {
+        return me.baseUrl
+    }
+
+    /**
      * Determine which formatter to use for the body
      * @param json The unformatted JSON
      * @param event The event that triggered this
@@ -496,12 +606,12 @@ class WebHook {
             def webhookListeners = triggers.get(event)
             if (webhookListeners) {
                 // We need to do this twice to do all async first
-                for (WebhookEndpointDetails webhook : webhookListeners) {
+                for (WebhookEndpointDetails webhookListener : webhookListeners) {
                     try {
-                        if (webhook.isAsync()) {
-                            if (eventPassedFilters(event, json, webhook))
+                        if (webhookListener.isAsync()) {
+                            if (eventPassedFilters(event, json, webhookListener))
                                 excutorService.execute(
-                                        new PostTask(webhook.url, getFormattedJSONString(json, event, webhook)))
+                                        new PostTask(webhookListener.url, getFormattedJSONString(json, event, webhookListener)))
                         }
                     } catch (Exception e) {
                         // We don't capture async results
@@ -512,8 +622,8 @@ class WebHook {
                 for (def webhookListener : webhookListeners) {
                     try {
                         if (!webhookListener.isAsync())
-                            if (eventPassedFilters(event, json, webhook))
-                                callPost(webhookListener.url, getFormattedJSONString(json, webhook))
+                            if (eventPassedFilters(event, json, webhookListener))
+                                callPost(webhookListener.url, getFormattedJSONString(json, event, webhookListener))
                     } catch (Exception e) {
                         if (debug)
                             e.printStackTrace()
@@ -557,7 +667,8 @@ class WebHook {
                     jsonData = new JsonSlurper().parseText(json.toString())
                 def matches = false
                 if (event.startsWith("docker")) {
-                    matches = webhook.matchesPathFilter(jsonData.docker.image)
+                    matches = webhook.matchesPathFilter(jsonData.docker.image) &&
+                        webhook.matchesTagFilter(jsonData.docker.tag)
                 } else if (event.startsWith("storage")) {
                     if (Globals.SUPPORT_MATRIX.storage.afterMove.name == event ||
                             Globals.SUPPORT_MATRIX.storage.afterCopy.name == event) {
@@ -598,12 +709,18 @@ class WebHook {
      * @return The response/error code from the remote site
      */
     private String callPost(String urlString, String content) {
-        def post = new URL(urlString).openConnection()
+        def url = new URL(urlString)
+        def post = url.openConnection()
         post.method = "POST"
         post.doOutput = true
         post.setConnectTimeout(connectionTimeout)
         post.setReadTimeout(connectionTimeout)
         post.setRequestProperty("Content-Type", "application/json")
+        def authidx = url.authority.indexOf('@')
+        if (authidx > 0) {
+            def auth = url.authority[0..<authidx].bytes.encodeBase64()
+            post.setRequestProperty("Authorization", "Basic $auth")
+        }
         def writer = null, reader = null
         try {
             writer = post.outputStream
@@ -655,8 +772,12 @@ class WebHook {
      * Loads and processes the configuration file
      */
     private void loadConfig() {
-        final String CONFIG_FILE_PATH = "${System.properties.'artifactory.home'}/etc/plugins/webhook.config.json"
+        final String CONFIG_FILE_PATH = "${System.properties.'artifactory.home'}/etc/artifactory/plugins/webhook.config.json"
         def inputFile = new File(CONFIG_FILE_PATH)
+        if (!inputFile.exists()) {
+            CONFIG_FILE_PATH = "${System.properties.'artifactory.home'}/etc/plugins/webhook.config.json"
+            inputFile = new File(CONFIG_FILE_PATH)
+        }
         def config = new JsonSlurper().parseText(inputFile.text)
         if (config && config.webhooks) {
             config.webhooks.each { name, webhook ->
@@ -668,6 +789,9 @@ class WebHook {
             // Timeout
             if (config.containsKey("timeout") && config.timeout > 0 && config.timeout <= MAX_TIMEOUT)
                 me.connectionTimeout = config.timeout
+            // BaseUrl
+            if (config.containsKey("baseurl"))
+                me.baseUrl = config.baseurl
         }
     }
 
@@ -758,6 +882,7 @@ class WebHook {
         def repositories = [ALL_REPOS] // All
         def async = true
         Pattern path = null
+        String tag = null
 
         boolean allRepos() {
             return repositories.contains(ALL_REPOS)
@@ -784,6 +909,16 @@ class WebHook {
         }
 
         /**
+         * Returns true if there is not a tag filter or if there is a matching tag
+         * @param actualTag The tag in the event
+         */
+        boolean matchesTagFilter(String actualTag) {
+            if(tag == null)
+                return true
+            return tag.equals(actualTag)
+        }
+
+        /**
          * Returns true if there is not a path filter or if there is and it matches the actual path
          * @param actualPath The path in the event
          */
@@ -801,6 +936,12 @@ class WebHook {
             // Remove leading '/'
             if (searchString.startsWith('/'))
                 searchString = searchString.substring(1)
+            //Set tag if one exists
+            def tagIndex = searchString.indexOf(':')
+            if (tagIndex >= 0 && tagIndex < searchString.length()-1) {
+                tag = searchString.substring(tagIndex+1)
+                searchString = searchString.substring(0, tagIndex)
+            }
             path = Pattern.compile(regexFilter(searchString))
         }
 
